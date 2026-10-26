@@ -2,22 +2,16 @@ import { logWarn, getWindowTop } from '../src/utils.js';
 import { registerBidder } from '../src/adapters/bidderFactory.js';
 import { Renderer } from '../src/Renderer.js';
 import { BANNER, VIDEO, NATIVE, AUDIO } from '../src/mediaTypes.js';
-import { config } from '../src/config.js';
 import { tryAppendQueryString } from '../libraries/urlUtils/urlUtils.js';
 import { ortbConverter } from '../libraries/ortbConverter/converter.js';
 import { isViewabilityMeasurable, getViewability } from '../libraries/percentInView/percentInView.js';
 import { getAdUnitElement } from '../src/utils/adUnits.js';
+import { ORTB_MTYPES } from '../libraries/ortbConverter/processors/mediaType.js';
 
 const BIDDER_CODE = 'connectad';
 const BIDDER_CODE_ALIAS = 'connectadrealtime';
 const ENDPOINT_URL = 'https://i.connectad.io/api/v3';
 const SUPPORTED_MEDIA_TYPES = [BANNER, VIDEO, NATIVE, AUDIO];
-const MTYPE_TO_MEDIATYPE = {
-  1: BANNER,
-  2: VIDEO,
-  3: AUDIO,
-  4: NATIVE
-};
 const REQUEST_MEDIATYPE_PRIORITY = [BANNER, VIDEO, AUDIO, NATIVE];
 
 const converter = ortbConverter({
@@ -112,7 +106,7 @@ const converter = ortbConverter({
         if (bidResponse.mediaType) {
           return;
         }
-        bidResponse.mediaType = MTYPE_TO_MEDIATYPE[Number(bid.mtype)] ||
+        bidResponse.mediaType = ORTB_MTYPES[Number(bid.mtype)] ||
           REQUEST_MEDIATYPE_PRIORITY.find((mediaType) => context.bidRequest?.mediaTypes?.[mediaType]);
         if (!bidResponse.mediaType) {
           orig(bidResponse, bid, context);
@@ -248,7 +242,7 @@ export const spec = {
     return converter.fromORTB({ response, request }).bids || [];
   },
 
-  getUserSyncs: (syncOptions, responses, gdprConsent, uspConsent, gppConsent) => {
+  getUserSyncs: (syncOptions, responses, gdprConsent, uspConsent, gppConsent, coppa) => {
     const pixelType = syncOptions.iframeEnabled ? 'iframe' : 'image';
     let syncEndpoint;
 
@@ -275,7 +269,7 @@ export const spec = {
       syncEndpoint = tryAppendQueryString(syncEndpoint, 'gpp_sid', gppConsent?.applicableSections?.join(','));
     }
 
-    if (config.getConfig('coppa') === true) {
+    if (coppa) {
       syncEndpoint = tryAppendQueryString(syncEndpoint, 'coppa', 1);
     }
 

@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { spec } from 'modules/ocmBidAdapter.js';
 import * as utils from 'src/utils.js';
+import { config } from 'src/config.js';
 import { Renderer } from 'src/Renderer.js';
 import { EVENT_TYPE_IMPRESSION, EVENT_TYPE_WIN, TRACKER_METHOD_IMG } from 'src/eventTrackers.js';
 // Side-effect import: registers the price-floors ORTB processors the adapter relies on through
@@ -9,6 +10,7 @@ import 'modules/priceFloors.js';
 
 const AUCTION_ENDPOINT = 'https://pbam.orangeclickmedia.com/openrtb2/auction';
 const USER_SYNC_LOADER = 'https://pbam.orangeclickmedia.com/static/cookie_sync.html';
+const USER_SYNC_REDIRECT = 'https://pbam.orangeclickmedia.com/cookie_sync/redirect';
 
 describe('ocmBidAdapter', function () {
   const baseParams = { publisherId: 'pub-123', placementId: 'plc-456' };
@@ -43,21 +45,25 @@ describe('ocmBidAdapter', function () {
     }
   };
 
+  const nativeOrtb = {
+    ver: '1.2',
+    assets: [
+      { id: 1, required: 1, title: { len: 80 } },
+      { id: 2, required: 0, data: { type: 1 } }
+    ]
+  };
+
+  // Prebid core derives `nativeOrtbRequest` from mediaTypes.native (ORTB or legacy params) and copies
+  // it onto every bid before an adapter sees it (decorateAdUnitsWithNativeParams in src/native, plus
+  // ADUNIT_BID_PROPERTIES in adapterManager). It is what the ORTB converter serialises into
+  // imp.native, so every native fixture here carries it exactly as production does.
   const nativeBid = {
     bidder: 'ocm',
     adUnitCode: 'div-native',
     bidId: 'bid-native-1',
     params: { ...baseParams },
-    mediaTypes: {
-      native: {
-        ortb: {
-          assets: [
-            { id: 1, required: 1, title: { len: 80 } },
-            { id: 2, required: 0, data: { type: 1 } }
-          ]
-        }
-      }
-    }
+    mediaTypes: { native: { ortb: nativeOrtb } },
+    nativeOrtbRequest: nativeOrtb
   };
 
   describe('isBidRequestValid', function () {
@@ -69,8 +75,10 @@ describe('ocmBidAdapter', function () {
       expect(spec.isBidRequestValid(videoBid)).to.equal(true);
     });
 
+    // Native is only ever sent when the NATIVE feature is compiled in; a build without it cannot
+    // produce a native imp, so the adapter must not claim the bid is valid either.
     it('returns true for a valid ORTB native bid', function () {
-      expect(spec.isBidRequestValid(nativeBid)).to.equal(true);
+      expect(spec.isBidRequestValid(nativeBid)).to.equal(!!FEATURES.NATIVE);
     });
 
     it('returns false when publisherId is missing', function () {
@@ -109,126 +117,112 @@ describe('ocmBidAdapter', function () {
       expect(spec.isBidRequestValid(bid)).to.equal(false);
     });
 
-    // Regression: a native video asset with minduration:0 must be accepted.
-    // Before the fix the falsy `!asset.video.minduration` check rejected a legitimate 0.
-    it('accepts a native video asset with minduration of 0', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: {
-          native: {
-            ortb: {
-              assets: [{
-                id: 1,
-                required: 1,
-                video: { mimes: ['video/mp4'], minduration: 0, maxduration: 30, protocols: [2, 3] }
-              }]
-            }
-          }
-        }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(true);
-    });
-
-    it('rejects a native video asset that is missing minduration', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: {
-          native: {
-            ortb: {
-              assets: [{
-                id: 1,
-                required: 1,
-                video: { mimes: ['video/mp4'], maxduration: 30, protocols: [2, 3] }
-              }]
-            }
-          }
-        }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
-
-    it('rejects an ORTB native bid whose event tracker has no methods', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: {
-          native: {
-            ortb: {
-              assets: [{ id: 1, required: 1, title: { len: 80 } }],
-              eventtrackers: [{ event: 1, methods: [] }]
-            }
-          }
-        }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
-
-    it('accepts an ORTB native bid with a valid event tracker', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: {
-          native: {
-            ortb: {
-              assets: [{ id: 1, required: 1, title: { len: 80 } }],
-              eventtrackers: [{ event: 1, methods: [1, 2] }]
-            }
-          }
-        }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(true);
-    });
-
     it('returns false for a bid with no params object', function () {
       expect(spec.isBidRequestValid({ bidder: 'ocm' })).to.equal(false);
     });
 
-    // isValidAsset rejection paths, reached through the ORTB native validation branch.
-    it('rejects an ORTB native asset that has no valid integer id', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: { native: { ortb: { assets: [{ required: 1, title: { len: 80 } }] } } }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
+    if (FEATURES.NATIVE) {
+      // Regression: the adapter used to re-validate mediaTypes.native.ortb assets with its own copy of
+      // core's rules. Assets core rejects but that copy accepted (an img asset with no w/h is the
+      // common one) made the bid "valid" while core had already dropped nativeOrtbRequest, so the
+      // converter built an imp with no `native` object at all and PBS received an empty impression.
+      it('rejects a native bid whose ad unit Prebid could not turn into a native ORTB request', function () {
+        const bid = {
+          ...nativeBid,
+          mediaTypes: { native: { ortb: { assets: [{ id: 1, required: 1, img: { type: 3 } }] } } },
+          nativeOrtbRequest: undefined
+        };
+        expect(spec.isBidRequestValid(bid)).to.equal(false);
+      });
 
-    it('rejects an ORTB native asset with no content (title/img/data/video)', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: { native: { ortb: { assets: [{ id: 1, required: 1 }] } } }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
+      it('warns when mediaTypes.native is declared but no native ORTB request was derived', function () {
+        const logWarnStub = sinon.stub(utils, 'logWarn');
+        try {
+          spec.isBidRequestValid({ ...nativeBid, nativeOrtbRequest: undefined });
+          expect(logWarnStub.called).to.equal(true);
+          expect(logWarnStub.firstCall.args[0]).to.contain('mediaTypes.native');
+        } finally {
+          logWarnStub.restore();
+        }
+      });
 
-    it('rejects an ORTB native title asset that is missing a valid len', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: { native: { ortb: { assets: [{ id: 1, required: 1, title: {} }] } } }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
+      it('rejects a native bid whose derived ORTB request has no assets', function () {
+        const bid = { ...nativeBid, nativeOrtbRequest: { ver: '1.2', assets: [] } };
+        expect(spec.isBidRequestValid(bid)).to.equal(false);
+      });
 
-    it('rejects an ORTB native data asset that is missing a valid type', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: { native: { ortb: { assets: [{ id: 1, required: 1, data: {} }] } } }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
+      // Core's isOpenRTBAssetValid tests img/title/data/video in an if/else chain with no final
+      // branch, so an asset that declares none of them is accepted and survives into
+      // nativeOrtbRequest. PBS has nothing to fill it with, so the adapter makes that one check.
+      it('rejects a derived ORTB request whose asset carries no title/img/data/video', function () {
+        const bid = { ...nativeBid, nativeOrtbRequest: { ver: '1.2', assets: [{ id: 1, required: 1 }] } };
+        expect(spec.isBidRequestValid(bid)).to.equal(false);
+      });
 
-    // Legacy (non-ORTB) native path: mediaTypes.native carries no `ortb`, so the adapter converts
-    // bid.nativeParams via toOrtbNativeRequest and validates the resulting assets.
-    it('returns false for a legacy native bid with no nativeParams', function () {
-      const bid = { ...nativeBid, mediaTypes: { native: {} } };
-      expect(spec.isBidRequestValid(bid)).to.equal(false);
-    });
+      it('rejects a derived ORTB request where only some assets carry content', function () {
+        const bid = {
+          ...nativeBid,
+          nativeOrtbRequest: {
+            ver: '1.2',
+            assets: [{ id: 1, required: 1, title: { len: 80 } }, { id: 2, required: 0 }]
+          }
+        };
+        expect(spec.isBidRequestValid(bid)).to.equal(false);
+      });
 
-    it('returns true for a legacy native bid whose nativeParams convert to a valid asset', function () {
-      const bid = {
-        ...nativeBid,
-        mediaTypes: { native: {} },
-        nativeParams: { title: { required: true, len: 80 } }
-      };
-      expect(spec.isBidRequestValid(bid)).to.equal(true);
-    });
+      // ORTB Native 1.2 §4.4 allows exactly one content object per asset. Core's if/else chain
+      // validates only the first one it reaches, so an asset declaring several survives into
+      // nativeOrtbRequest and would reach PBS ambiguous about which object to fill.
+      it('rejects a derived ORTB request whose asset carries more than one content object', function () {
+        [
+          { id: 1, img: { type: 3, w: 150, h: 150 }, data: { type: 1 } },
+          { id: 1, title: { len: 80 }, img: { type: 3, w: 150, h: 150 } },
+          { id: 1, title: { len: 80 }, img: { type: 3, w: 150, h: 150 }, data: { type: 1 }, video: { mimes: ['video/mp4'] } }
+        ].forEach((asset) => {
+          const bid = { ...nativeBid, nativeOrtbRequest: { ver: '1.2', assets: [asset] } };
+          expect(spec.isBidRequestValid(bid), JSON.stringify(asset)).to.equal(false);
+        });
+      });
+
+      it('accepts assets carrying any one of the four ORTB content objects', function () {
+        [
+          { id: 1, title: { len: 80 } },
+          { id: 1, img: { type: 3, w: 150, h: 150 } },
+          { id: 1, data: { type: 1 } },
+          { id: 1, video: { mimes: ['video/mp4'], minduration: 0, maxduration: 30, protocols: [2, 3] } }
+        ].forEach((asset) => {
+          const bid = { ...nativeBid, nativeOrtbRequest: { ver: '1.2', assets: [asset] } };
+          expect(spec.isBidRequestValid(bid), JSON.stringify(asset)).to.equal(true);
+        });
+      });
+
+      // Legacy (non-ORTB) native ad units: core converts mediaTypes.native params into the same
+      // nativeOrtbRequest, so they are valid on exactly the same terms as ORTB ones.
+      it('returns true for a legacy native bid core converted to an ORTB request', function () {
+        const bid = {
+          ...nativeBid,
+          mediaTypes: { native: { title: { required: true, len: 80 } } },
+          nativeParams: { title: { required: true, len: 80 } },
+          nativeOrtbRequest: { ver: '1.2', assets: [{ id: 0, required: 1, title: { len: 80 } }] }
+        };
+        expect(spec.isBidRequestValid(bid)).to.equal(true);
+      });
+
+      it('returns false for a legacy native bid core could not convert', function () {
+        const bid = { ...nativeBid, mediaTypes: { native: {} }, nativeOrtbRequest: undefined };
+        expect(spec.isBidRequestValid(bid)).to.equal(false);
+      });
+
+      // A broken native declaration must not cost the ad unit its other formats.
+      it('stays valid through banner when the native part of a multi-format ad unit is unusable', function () {
+        const bid = {
+          ...nativeBid,
+          mediaTypes: { banner: { sizes: [[300, 250]] }, native: { ortb: { assets: [] } } },
+          nativeOrtbRequest: undefined
+        };
+        expect(spec.isBidRequestValid(bid)).to.equal(true);
+      });
+    }
   });
 
   describe('buildRequests', function () {
@@ -238,6 +232,11 @@ describe('ocmBidAdapter', function () {
       expect(request.method).to.equal('POST');
       expect(request.url).to.equal(AUCTION_ENDPOINT);
       expect(request.data).to.be.an('object');
+    });
+
+    it('asks core to gzip the request body via options.endpointCompression', function () {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      expect(request.options.endpointCompression).to.equal(true);
     });
 
     it('maps placementId into imp.ext.prebid.storedrequest.id', function () {
@@ -277,6 +276,110 @@ describe('ocmBidAdapter', function () {
     it('attaches publisherId to the site publisher object', function () {
       const request = spec.buildRequests([bannerBid], bannerBidderRequest);
       expect(request.data.site.publisher.id).to.equal('pub-123');
+    });
+
+    // In-app traffic carries an ORTB `app` object rather than `site`; the publisher id has to follow it
+    // there, or PBS resolves the request against no account at all.
+    it('attaches publisherId to the app publisher object for in-app traffic', function () {
+      const request = spec.buildRequests([bannerBid], {
+        ...bannerBidderRequest,
+        ortb2: { app: { bundle: 'com.orangeclickmedia.demo' } }
+      });
+      expect(request.data.app.publisher.id).to.equal('pub-123');
+    });
+
+    it('sends no publisher id when the bid carries no params', function () {
+      const paramlessBid = { ...bannerBid, params: undefined };
+      const request = spec.buildRequests([paramlessBid], { bidderCode: 'ocm', bids: [paramlessBid] });
+      expect(request.data.site?.publisher?.id).to.equal(undefined);
+    });
+
+    describe('tmax', function () {
+      // PBS must answer early enough for the response to travel back and be parsed before Prebid's
+      // auction timer fires, so the tmax it is given is the auction timeout minus a buffer, while the
+      // un-buffered timeout is advertised as ext.tmaxmax.
+      it('reserves a buffer out of the auction timeout and sends the full timeout as ext.tmaxmax', function () {
+        const request = spec.buildRequests([bannerBid], { ...bannerBidderRequest, timeout: 1000 });
+        expect(request.data.tmax).to.equal(800);
+        expect(request.data.ext.tmaxmax).to.equal(1000);
+      });
+
+      // The buffer is capped proportionally, so a deliberately short timeout is not cut to nothing.
+      it('caps the buffer at a quarter of a short auction timeout', function () {
+        const request = spec.buildRequests([bannerBid], { ...bannerBidderRequest, timeout: 200 });
+        expect(request.data.tmax).to.equal(150);
+        expect(request.data.ext.tmaxmax).to.equal(200);
+      });
+
+      it('honours a publisher-supplied ortb2.tmax that tightens the server budget', function () {
+        const request = spec.buildRequests([bannerBid], {
+          ...bannerBidderRequest,
+          timeout: 1000,
+          ortb2: { tmax: 400 }
+        });
+        expect(request.data.tmax).to.equal(400);
+        // The real ceiling is still reported, so PBS knows what the client will actually wait for.
+        expect(request.data.ext.tmaxmax).to.equal(1000);
+      });
+
+      // Honouring an ortb2.tmax that reaches the full auction timeout would hand back the very
+      // failure this buffer exists to prevent: PBS answers on time, but not early enough for the
+      // response to be parsed before the auction timer fires, so the bids are discarded.
+      it('clamps a publisher-supplied ortb2.tmax at the buffered deadline', function () {
+        const request = spec.buildRequests([bannerBid], {
+          ...bannerBidderRequest,
+          timeout: 1000,
+          ortb2: { tmax: 1000 }
+        });
+        expect(request.data.tmax).to.equal(800);
+        expect(request.data.ext.tmaxmax).to.equal(1000);
+      });
+
+      // Raising tmax past the client deadline must never produce a request that asks PBS for longer
+      // than the ceiling this adapter advertises in the same payload.
+      it('never sends a tmax above the ext.tmaxmax it advertises itself', function () {
+        const request = spec.buildRequests([bannerBid], {
+          ...bannerBidderRequest,
+          timeout: 1000,
+          ortb2: { tmax: 1500 }
+        });
+        expect(request.data.tmax).to.equal(800);
+        expect(request.data.tmax).to.be.at.most(request.data.ext.tmaxmax);
+      });
+
+      // A publisher who pins ext.tmaxmax in first-party data keeps it verbatim, and tmax is NOT
+      // narrowed to it. That is deliberate: core's own PBS adapter behaves identically (it preserves a
+      // supplied ext.tmaxmax and computes tmax from the s2s timeout — see
+      // modules/prebidServerBidAdapter/ortbConverter.js), ortb2.tmax is the documented knob for
+      // tightening the server budget, and no PBS reads tmaxmax as a hard cap (PBS-Go has no such field;
+      // PBS-Java clamps timeouts rather than rejecting them). Reusing it as a second tmax knob would
+      // silently cut the server's budget from a field that states the client's total ceiling.
+      it('preserves a publisher-pinned ext.tmaxmax without narrowing tmax to it', function () {
+        const request = spec.buildRequests([bannerBid], {
+          ...bannerBidderRequest,
+          timeout: 1000,
+          ortb2: { ext: { tmaxmax: 100 } }
+        });
+        expect(request.data.ext.tmaxmax).to.equal(100);
+        expect(request.data.tmax).to.equal(800);
+      });
+
+      // With no auction timeout there is no deadline to clamp against, so the publisher's explicit
+      // value is the only signal available and is sent as-is.
+      it('sends a publisher-supplied ortb2.tmax as-is when the auction timeout is unknown', function () {
+        const request = spec.buildRequests([bannerBid], {
+          ...bannerBidderRequest,
+          ortb2: { tmax: 500 }
+        });
+        expect(request.data.tmax).to.equal(500);
+        expect(request.data.ext?.tmaxmax).to.equal(undefined);
+      });
+
+      it('sends no tmax when the auction timeout is unknown', function () {
+        const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+        expect(request.data.tmax).to.equal(undefined);
+        expect(request.data.ext?.tmaxmax).to.equal(undefined);
+      });
     });
   });
 
@@ -327,6 +430,21 @@ describe('ocmBidAdapter', function () {
       const request = spec.buildRequests([bannerBid], bannerBidderRequest);
       const result = spec.interpretResponse({ body: { id: 'auction-1', cur: 'USD', seatbid: [] } }, request);
       expect(result).to.be.an('array').that.is.empty;
+    });
+
+    // PBS resolves demand from real server-side seats, so seatbid[].seat is usually another bidder's
+    // code. The converter's bidderCode override must re-attribute it to `ocm`, otherwise core drops
+    // the bid as an unregistered alternate bidder code.
+    it('re-attributes a bid returned under a server-side seat to the ocm bidderCode', function () {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      const seatResponse = {
+        body: {
+          ...sampleResponse.body,
+          seatbid: [{ ...sampleResponse.body.seatbid[0], seat: 'appnexus' }]
+        }
+      };
+      const bid = spec.interpretResponse(seatResponse, request)[0];
+      expect(bid.bidderCode).to.equal('ocm');
     });
   });
 
@@ -387,10 +505,34 @@ describe('ocmBidAdapter', function () {
         const parsed = JSON.parse(imp.native.request);
         expect(parsed.assets).to.have.lengthOf(3);
         expect(parsed.ver).to.equal('1.2');
+        expect(imp.native.ver).to.equal('1.2');
       }
       // The stored-request wiring and PBS bidder-params cleanup apply to native imps as well.
       expect(imp.ext.prebid.storedrequest.id).to.equal('plc-456');
       expect(imp.ext.prebid.bidder).to.equal(undefined);
+    });
+
+    // An ORTB native ad unit that does not spell out `ver` used to produce an imp.native with no
+    // version at all (only the legacy path got one, from core's toOrtbNativeRequest). The converter
+    // context now defaults it, while a publisher-supplied version still wins.
+    it('defaults the native request version and keeps a publisher-supplied one', function () {
+      if (!FEATURES.NATIVE) {
+        return;
+      }
+      const { ver, ...versionless } = nativeOrtbRequest;
+      const defaulted = spec.buildRequests(
+        [{ ...nativeRequestBid, nativeOrtbRequest: versionless }],
+        nativeBidderRequest
+      ).data.imp[0];
+      expect(defaulted.native.ver).to.equal('1.2');
+      expect(JSON.parse(defaulted.native.request).ver).to.equal('1.2');
+
+      const pinned = { ...nativeOrtbRequest, ver: '1.1' };
+      const pinnedImp = spec.buildRequests(
+        [{ ...nativeRequestBid, nativeOrtbRequest: pinned }],
+        nativeBidderRequest
+      ).data.imp[0];
+      expect(pinnedImp.native.ver).to.equal('1.1');
     });
 
     it('interprets a native ORTB response into bidResponse.native.ortb', function () {
@@ -467,15 +609,22 @@ describe('ocmBidAdapter', function () {
       };
     }
 
+    function trackersForEvent(bid, event) {
+      return (bid.eventtrackers || []).filter((t) => t.event === event);
+    }
+
     function trackersFor(bid, event) {
-      return (bid.eventtrackers || []).filter((t) => t.event === event && t.method === TRACKER_METHOD_IMG);
+      return trackersForEvent(bid, event).filter((t) => t.method === TRACKER_METHOD_IMG);
     }
 
     it('registers the impression event URL as an image impression tracker so core fires it on billing', function () {
       const request = spec.buildRequests([bannerBid], bannerBidderRequest);
       const bid = spec.interpretResponse(responseWithEvents({ imp: IMP_URL }), request)[0];
+      const allImpTrackers = trackersForEvent(bid, EVENT_TYPE_IMPRESSION);
       const impTrackers = trackersFor(bid, EVENT_TYPE_IMPRESSION);
+      expect(allImpTrackers).to.have.lengthOf(1);
       expect(impTrackers).to.have.lengthOf(1);
+      expect(impTrackers[0].method).to.equal(TRACKER_METHOD_IMG);
       expect(impTrackers[0].url).to.equal(IMP_URL);
     });
 
@@ -485,8 +634,11 @@ describe('ocmBidAdapter', function () {
     it('registers the win event URL as an image win tracker so core fires it when the bid wins', function () {
       const request = spec.buildRequests([bannerBid], bannerBidderRequest);
       const bid = spec.interpretResponse(responseWithEvents({ win: WIN_URL }), request)[0];
+      const allWinTrackers = trackersForEvent(bid, EVENT_TYPE_WIN);
       const winTrackers = trackersFor(bid, EVENT_TYPE_WIN);
+      expect(allWinTrackers).to.have.lengthOf(1);
       expect(winTrackers).to.have.lengthOf(1);
+      expect(winTrackers[0].method).to.equal(TRACKER_METHOD_IMG);
       expect(winTrackers[0].url).to.equal(WIN_URL);
     });
 
@@ -527,6 +679,195 @@ describe('ocmBidAdapter', function () {
       const bid = spec.interpretResponse(bareResponse, request)[0];
       expect(trackersFor(bid, EVENT_TYPE_IMPRESSION)).to.have.lengthOf(0);
       expect(trackersFor(bid, EVENT_TYPE_WIN)).to.have.lengthOf(0);
+    });
+  });
+
+  describe('billing macro substitution', function () {
+    const BURL = 'https://dsp.orangeclickmedia.com/bill?impid=i-1&price=${AUCTION_PRICE}&cur=USD&sig=abc';
+    const IMP_URL = 'https://pbam.orangeclickmedia.com/event?t=imp&b=evt-bid-1&a=pub-123';
+
+    // Mirrors the captured production shape: PBS converts the bidder's bid to the request currency
+    // and leaves the pre-conversion original on the bid as ext.origbidcpm/ext.origbidcur. The two
+    // must stay distinct here so a regression to the wrong currency fails loudly.
+    const CONVERTED_PRICE = 0.016756615; // USD, what PBS returns as bid.price
+    const ORIGINAL_PRICE = 0.01459; // EUR, what the bidder actually bid
+
+    // `bidId: null` omits the ORTB bid.id entirely (passing `undefined` would re-trigger the
+    // default). `pbsBidId` sets the PBS-generated ext.prebid.bidid, which must NOT be used.
+    function macroResponse({ burl, events, price = CONVERTED_PRICE, bidId = 'ortb-bid-1', pbsBidId, origbid = true } = {}) {
+      const ext = {};
+      if (events || pbsBidId) {
+        ext.prebid = {};
+        if (events) ext.prebid.events = events;
+        if (pbsBidId) ext.prebid.bidid = pbsBidId;
+      }
+      if (origbid) {
+        ext.origbidcpm = ORIGINAL_PRICE;
+        ext.origbidcur = 'EUR';
+      }
+      const bid = {
+        impid: 'bid-banner-1',
+        price,
+        adm: '<div>OCM Ad</div>',
+        crid: 'creative-1',
+        w: 300,
+        h: 250,
+        mtype: 1,
+        ext
+      };
+      if (bidId) bid.id = bidId;
+      if (burl !== undefined) bid.burl = burl;
+      return { body: { id: 'auction-macro', cur: 'USD', seatbid: [{ seat: 'ocm', bid: [bid] }] } };
+    }
+
+    function impTrackers(bid) {
+      return (bid.eventtrackers || []).filter((t) => t.event === EVENT_TYPE_IMPRESSION && t.method === TRACKER_METHOD_IMG);
+    }
+
+    function interpret(response) {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      return spec.interpretResponse(response, request)[0];
+    }
+
+    it('substitutes ${AUCTION_PRICE} in burl with the clearing price', function () {
+      const bid = interpret(macroResponse({ burl: BURL }));
+      const trackers = impTrackers(bid);
+      expect(trackers).to.have.lengthOf(1);
+      expect(trackers[0].url).to.contain(`price=${CONVERTED_PRICE}`);
+      expect(trackers[0].url).to.not.contain('${AUCTION_PRICE}');
+    });
+
+    // The DSP stamps the auction currency into the signed `cur` parameter at bid time and converts
+    // the reported price itself, so ${AUCTION_PRICE} must be bid.price in the response currency —
+    // NOT the bidder's pre-conversion ext.origbidcpm, which would be mis-billed by the FX rate.
+    it('uses the converted bid.price, not the pre-conversion ext.origbidcpm', function () {
+      const bid = interpret(macroResponse({ burl: BURL }));
+      const url = impTrackers(bid)[0].url;
+      expect(url).to.contain(`price=${CONVERTED_PRICE}`);
+      expect(url).to.not.contain(String(ORIGINAL_PRICE));
+    });
+
+    it('substitutes ${AUCTION_BID_ID} from the ORTB bid.id', function () {
+      const burl = 'https://dsp.orangeclickmedia.com/bill?bidid=${AUCTION_BID_ID}&price=${AUCTION_PRICE}';
+      const bid = interpret(macroResponse({ burl, bidId: 'uuid-42' }));
+      const url = impTrackers(bid)[0].url;
+      expect(url).to.contain('bidid=uuid-42');
+      expect(url).to.not.contain('${AUCTION_BID_ID}');
+    });
+
+    // ext.prebid.bidid is minted by PBS for its own event URLs; the bidder has never seen it, so
+    // handing it back in the bidder's own URL would be an id the DSP cannot resolve.
+    it('does not use the PBS-generated ext.prebid.bidid for ${AUCTION_BID_ID}', function () {
+      const burl = 'https://dsp.orangeclickmedia.com/bill?bidid=${AUCTION_BID_ID}';
+      const bid = interpret(macroResponse({ burl, bidId: 'ortb-id-1', pbsBidId: 'pbs-generated-9' }));
+      const url = impTrackers(bid)[0].url;
+      expect(url).to.contain('bidid=ortb-id-1');
+      expect(url).to.not.contain('pbs-generated-9');
+    });
+
+    // Emptying the macro would turn a malformed request into a well-formed one carrying no id,
+    // which the DSP would accept and mis-attribute. Leaving it intact keeps the failure loud.
+    it('leaves ${AUCTION_BID_ID} untouched when the ORTB bid.id is absent', function () {
+      const burl = 'https://dsp.orangeclickmedia.com/bill?bidid=${AUCTION_BID_ID}&price=${AUCTION_PRICE}';
+      const bid = interpret(macroResponse({ burl, bidId: null }));
+      const url = impTrackers(bid)[0].url;
+      expect(url).to.contain('bidid=${AUCTION_BID_ID}');
+      expect(url).to.contain(`price=${CONVERTED_PRICE}`);
+    });
+
+    it('replaces every occurrence of a macro in one URL', function () {
+      const burl = 'https://dsp.orangeclickmedia.com/bill?price=${AUCTION_PRICE}&check=${AUCTION_PRICE}';
+      const bid = interpret(macroResponse({ burl }));
+      const url = impTrackers(bid)[0].url;
+      expect(url).to.not.contain('${AUCTION_PRICE}');
+      expect(url).to.equal(`https://dsp.orangeclickmedia.com/bill?price=${CONVERTED_PRICE}&check=${CONVERTED_PRICE}`);
+    });
+
+    it('substitutes a zero clearing price rather than blanking the macro', function () {
+      const bid = interpret(macroResponse({ burl: BURL, price: 0 }));
+      const trackers = impTrackers(bid);
+      // A zero-price bid may not survive as a bid response; assert only when it does.
+      if (trackers.length) {
+        expect(trackers[0].url).to.contain('price=0');
+        expect(trackers[0].url).to.not.contain('price=&');
+      }
+    });
+
+    it('leaves a burl with no macros unchanged', function () {
+      const plain = 'https://dsp.orangeclickmedia.com/bill?impid=i-1&sig=abc';
+      const bid = interpret(macroResponse({ burl: plain }));
+      expect(impTrackers(bid)[0].url).to.equal(plain);
+    });
+
+    it('produces no impression tracker and no error when burl is absent', function () {
+      let bid;
+      expect(() => { bid = interpret(macroResponse({})); }).to.not.throw();
+      expect(impTrackers(bid)).to.have.lengthOf(0);
+    });
+
+    it('substitutes the impression event URL so the dedup guard still matches burl', function () {
+      const shared = 'https://pbam.orangeclickmedia.com/event?t=imp&b=evt-bid-1&price=${AUCTION_PRICE}';
+      const bid = interpret(macroResponse({ burl: shared, events: { imp: shared } }));
+      const trackers = impTrackers(bid);
+      expect(trackers).to.have.lengthOf(1);
+      expect(trackers[0].url).to.contain(`price=${CONVERTED_PRICE}`);
+      expect(trackers[0].url).to.not.contain('${AUCTION_PRICE}');
+    });
+
+    // A PBS event URL distinct from burl belongs to PBS: its ${AUCTION_BID_ID} is not the DSP's
+    // bid.id, so only the DSP's billing URL may be rewritten.
+    it('does not rewrite a distinct events.imp URL', function () {
+      const burl = 'https://dsp.orangeclickmedia.com/bill?bidid=${AUCTION_BID_ID}&price=${AUCTION_PRICE}';
+      const imp = 'https://pbam.orangeclickmedia.com/event?t=imp&b=${AUCTION_BID_ID}&price=${AUCTION_PRICE}';
+      const response = macroResponse({ burl, events: { imp }, bidId: 'ortb-bid-7' });
+      const bid = interpret(response);
+      const raw = response.body.seatbid[0].bid[0];
+      expect(raw.burl).to.equal(`https://dsp.orangeclickmedia.com/bill?bidid=ortb-bid-7&price=${CONVERTED_PRICE}`);
+      expect(raw.ext.prebid.events.imp).to.equal(imp);
+      const urls = impTrackers(bid).map((t) => t.url);
+      expect(urls).to.include(raw.burl);
+      expect(urls).to.not.include(`https://pbam.orangeclickmedia.com/event?t=imp&b=ortb-bid-7&price=${CONVERTED_PRICE}`);
+    });
+
+    it('still registers exactly one impression tracker when burl equals a macro-free events.imp', function () {
+      const bid = interpret(macroResponse({ burl: IMP_URL, events: { imp: IMP_URL } }));
+      expect(impTrackers(bid)).to.have.lengthOf(1);
+    });
+
+    // The substitution pass walks the raw ORTB response before the converter does, so it has to
+    // tolerate the shapes a server can legitimately return: no seatbid at all, and a seat block
+    // carrying no bids.
+    it('handles a response with no seatbid without throwing', function () {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      let result;
+      expect(() => { result = spec.interpretResponse({ body: { id: 'auction-empty', cur: 'USD' } }, request); }).to.not.throw();
+      expect(result).to.be.an('array').that.is.empty;
+    });
+
+    it('handles a seatbid entry with no bids without throwing', function () {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      let result;
+      const response = { body: { id: 'auction-seat-empty', cur: 'USD', seatbid: [{ seat: 'ocm' }] } };
+      expect(() => { result = spec.interpretResponse(response, request); }).to.not.throw();
+      expect(result).to.be.an('array').that.is.empty;
+    });
+
+    // With neither a usable price nor an id there is no substitution to make, so the URLs are left
+    // exactly as the server sent them rather than rewritten with empty values.
+    it('leaves both URLs untouched when the bid supplies neither a price nor an id', function () {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      const burl = 'https://dsp.orangeclickmedia.com/bill?price=${AUCTION_PRICE}&bidid=${AUCTION_BID_ID}';
+      const response = {
+        body: {
+          id: 'auction-no-subs',
+          cur: 'USD',
+          seatbid: [{ seat: 'ocm', bid: [{ impid: 'bid-banner-1', burl, ext: { prebid: { events: { imp: burl } } } }] }]
+        }
+      };
+      expect(() => spec.interpretResponse(response, request)).to.not.throw();
+      const raw = response.body.seatbid[0].bid[0];
+      expect(raw.burl).to.equal(burl);
+      expect(raw.ext.prebid.events.imp).to.equal(burl);
     });
   });
 
@@ -580,6 +921,26 @@ describe('ocmBidAdapter', function () {
       const node = document.getElementById('div-video-outstream');
       if (node) node.remove();
     });
+
+    // Renders an interpreted outstream bid through a stubbed window.OcmPlayer and returns the player
+    // config it was handed. `overrides` are applied to the bid the renderer receives, which is how
+    // core-populated fields (player dimensions) and their absence are simulated.
+    function capturePlayerConfig(bid, overrides = {}) {
+      bid.adUnitCode = outstreamVideoBid.adUnitCode;
+      const slot = document.createElement('div');
+      slot.id = outstreamVideoBid.adUnitCode;
+      document.body.appendChild(slot);
+      window.OcmPlayer = sinon.spy();
+
+      bid.renderer.loaded = true;
+      bid.renderer._render({ ...bid, ...overrides });
+      return window.OcmPlayer.firstCall.args[1];
+    }
+
+    function interpretOutstream(response) {
+      const request = spec.buildRequests([outstreamVideoBid], outstreamBidderRequest);
+      return spec.interpretResponse(response || videoResponse('bid-video-outstream-1'), request)[0];
+    }
 
     it('attaches the OCM renderer to outstream video bids', function () {
       const request = spec.buildRequests([outstreamVideoBid], outstreamBidderRequest);
@@ -693,6 +1054,29 @@ describe('ocmBidAdapter', function () {
       expect(config.player.outstream.type).to.equal('in-article');
     });
 
+    // buildOcmPlayerConfig falls back to an empty override set when the renderer cannot supply one,
+    // so the player still receives the adapter's own defaults instead of a merge against undefined.
+    it('renders with the default player config when the renderer supplies no overrides', function () {
+      const request = spec.buildRequests([outstreamVideoBid], outstreamBidderRequest);
+      const bid = spec.interpretResponse(videoResponse('bid-video-outstream-1'), request)[0];
+      bid.adUnitCode = outstreamVideoBid.adUnitCode;
+      bid.adId = 'ad-id-no-overrides';
+
+      const slot = document.createElement('div');
+      slot.id = outstreamVideoBid.adUnitCode;
+      document.body.appendChild(slot);
+      window.OcmPlayer = sinon.spy();
+      bid.renderer.getConfig = () => undefined;
+
+      bid.renderer.loaded = true;
+      expect(() => bid.renderer._render(bid)).to.not.throw();
+
+      expect(window.OcmPlayer.calledOnce).to.equal(true);
+      const config = window.OcmPlayer.firstCall.args[1];
+      expect(config.player.muted).to.equal(true);
+      expect(config.player.outstream.type).to.equal('in-article');
+    });
+
     it('logs an error without throwing when window.OcmPlayer is unavailable', function () {
       const request = spec.buildRequests([outstreamVideoBid], outstreamBidderRequest);
       const bid = spec.interpretResponse(videoResponse('bid-video-outstream-1'), request)[0];
@@ -774,17 +1158,88 @@ describe('ocmBidAdapter', function () {
       expect(logErr.called).to.equal(true);
       logErr.restore();
     });
+
+    // The hosted VAST URL is preferred, but PBS may return only an inline VAST document; the player
+    // still has to be handed a source rather than `undefined`.
+    it('falls back to the inline VAST document when no hosted VAST URL is present', function () {
+      const response = videoResponse('bid-video-outstream-1');
+      delete response.body.seatbid[0].bid[0].nurl;
+      const playerConfig = capturePlayerConfig(interpretOutstream(response));
+      if (FEATURES.VIDEO) {
+        expect(playerConfig.ads.preroll[0].waterfall[0].vast.url).to.equal('<VAST version="4.0"></VAST>');
+      }
+    });
+
+    it('prefers explicit player dimensions over the creative size', function () {
+      const playerConfig = capturePlayerConfig(interpretOutstream(), { playerWidth: 800, playerHeight: 600 });
+      expect(playerConfig.player.width).to.equal('800px');
+      expect(playerConfig.player.height).to.equal('600px');
+    });
+
+    // Dimensions are only suffixed with px when numeric, so a CSS string the publisher supplied
+    // reaches the player intact instead of becoming '100%px'.
+    it('passes through non-numeric player dimensions unchanged', function () {
+      const playerConfig = capturePlayerConfig(interpretOutstream(), { playerWidth: '100%', playerHeight: '15rem' });
+      expect(playerConfig.player.width).to.equal('100%');
+      expect(playerConfig.player.height).to.equal('15rem');
+    });
+
+    it('omits player dimensions when the bid carries none', function () {
+      const playerConfig = capturePlayerConfig(interpretOutstream(), {
+        playerWidth: undefined, playerHeight: undefined, width: undefined, height: undefined
+      });
+      expect(playerConfig.player.width).to.equal(undefined);
+      expect(playerConfig.player.height).to.equal(undefined);
+    });
   });
 
   describe('getUserSyncs', function () {
     const syncResponses = [{ body: { ext: { responsetimemillis: { appnexus: 80, rubicon: 120 } } } }];
+    // GDPR applies and purpose 1 (device storage/access) is consented — the shape cookie syncing needs.
+    const purpose1Consent = {
+      gdprApplies: true,
+      consentString: 'consent-xyz',
+      vendorData: { purpose: { consents: { 1: true } } }
+    };
 
-    it('returns no syncs when iframe syncing is disabled', function () {
-      expect(spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses)).to.deep.equal([]);
+    let filterSettingsBefore;
+
+    // Reads back the filterSettings object the adapter forwards to PBS /cookie_sync.
+    function forwardedFilterSettings(url) {
+      const match = /[?&]filterSettings=([^&]*)/.exec(url);
+      return match ? JSON.parse(decodeURIComponent(match[1])) : undefined;
+    }
+
+    function setFilterSettings(filterSettings) {
+      config.setConfig({ userSync: { filterSettings } });
+    }
+
+    beforeEach(function () {
+      filterSettingsBefore = config.getConfig('userSync.filterSettings');
+    });
+
+    afterEach(function () {
+      config.setConfig({ coppa: false, userSync: { filterSettings: filterSettingsBefore } });
+    });
+
+    it('returns no syncs (and warns) when neither iframe nor image syncing is enabled', function () {
+      const warn = sinon.stub(utils, 'logWarn');
+      try {
+        expect(spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: false }, syncResponses)).to.deep.equal([]);
+        expect(warn.called).to.equal(true);
+      } finally {
+        warn.restore();
+      }
     });
 
     it('returns no syncs when the auction response lists no bidders', function () {
       expect(spec.getUserSyncs({ iframeEnabled: true }, [{ body: {} }])).to.deep.equal([]);
+    });
+
+    // Core calls getUserSyncs even when the auction produced no server responses at all (e.g. every
+    // request errored), so the bidder list has to degrade to empty rather than throw.
+    it('returns no syncs when there are no auction responses at all', function () {
+      expect(spec.getUserSyncs({ iframeEnabled: true })).to.deep.equal([]);
     });
 
     it('returns an iframe sync to the loader page with the bidders from the response', function () {
@@ -796,40 +1251,293 @@ describe('ocmBidAdapter', function () {
       expect(syncs[0].url).to.contain('limit=10');
     });
 
+    // Core's default filterSettings enable image syncs only, so this is the path most publishers get;
+    // returning [] here (the old behaviour) meant they silently synced nothing at all.
+    it('falls back to an image sync to the redirect endpoint when only image syncing is enabled', function () {
+      const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+      expect(syncs).to.have.lengthOf(1);
+      expect(syncs[0].type).to.equal('image');
+      expect(syncs[0].url.indexOf(USER_SYNC_REDIRECT)).to.equal(0);
+      expect(decodeURIComponent(syncs[0].url)).to.contain('bidders=appnexus,rubicon');
+      expect(syncs[0].url).to.contain('limit=10');
+    });
+
+    // The loader can drop both iframe and redirect syncs, so it wins whenever it is allowed.
+    it('prefers the iframe loader when both sync types are enabled', function () {
+      const syncs = spec.getUserSyncs({ iframeEnabled: true, pixelEnabled: true }, syncResponses);
+      expect(syncs[0].type).to.equal('iframe');
+      expect(syncs[0].url.indexOf(USER_SYNC_LOADER)).to.equal(0);
+    });
+
     it('derives bidders from seatbid seats when responsetimemillis is absent', function () {
       const responses = [{ body: { seatbid: [{ seat: 'pubmatic' }, { seat: 'ix' }] } }];
       const syncs = spec.getUserSyncs({ iframeEnabled: true }, responses);
       expect(decodeURIComponent(syncs[0].url)).to.contain('bidders=pubmatic,ix');
     });
 
-    it('constrains the loader to iframe syncs and disables cooperative syncing by default', function () {
-      // When only iframe syncing is enabled, the loader must be told not to drop image/redirect syncs
-      // and not to co-operatively sync bidders the publisher never requested.
+    it('disables PBS cooperative syncing so only auction participants are synced', function () {
       const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses);
-      const url = decodeURIComponent(syncs[0].url);
-      expect(url).to.contain('filter=iframe');
-      expect(url).to.not.contain('image');
       expect(syncs[0].url).to.contain('coopSync=0');
     });
 
-    it('allows image syncs in the loader filter when pixel syncing is enabled', function () {
-      const syncs = spec.getUserSyncs({ iframeEnabled: true, pixelEnabled: true }, syncResponses);
-      expect(decodeURIComponent(syncs[0].url)).to.contain('filter=iframe,image');
+    describe('filterSettings forwarding', function () {
+      // A sync type Prebid did not authorise for ocm has to be blocked explicitly: PBS treats an
+      // absent per-type filter as "allowed for every bidder".
+      it('blocks the sync type Prebid did not authorise', function () {
+        setFilterSettings({ iframe: { bidders: '*', filter: 'include' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: true, pixelEnabled: false }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url)).to.deep.equal({
+          iframe: { bidders: '*', filter: 'include' },
+          image: { bidders: '*', filter: 'exclude' }
+        });
+      });
+
+      // An include list enumerates the client-side adapters allowed to sync — it is not a list of
+      // seats in OCM's stored request. Forwarding the leftovers as a server-side allowlist would cut
+      // every PBS bidder the publisher never named, even though they only meant "ocm and bidderA may
+      // both register syncs".
+      it('does not turn a client-side include list into a server-side allowlist', function () {
+        setFilterSettings({ iframe: { bidders: ['ocm', 'bidderA', 'bidderB'], filter: 'include' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).iframe).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      // The exclude direction does survive the translation: PBS bidder names and Prebid bidder codes
+      // are the same names by convention, and an exclude can only ever drop a sync.
+      it('preserves an exclude filter', function () {
+        setFilterSettings({ image: { bidders: ['bidderB'], filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: ['bidderB'],
+          filter: 'exclude'
+        });
+      });
+
+      it('drops ocm itself from a forwarded exclude list', function () {
+        setFilterSettings({ image: { bidders: ['ocm', 'bidderB'], filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: ['bidderB'],
+          filter: 'exclude'
+        });
+      });
+
+      // Fails closed rather than open: an exclude-everyone rule must not be widened to allow-all.
+      it('forwards an exclude-all filter as a block', function () {
+        setFilterSettings({ image: { bidders: '*', filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: '*',
+          filter: 'exclude'
+        });
+      });
+
+      // `bidders: ['ocm']` (the shape the adapter's docs recommend) authorises the OCM sync itself;
+      // it must not be forwarded literally, or PBS would allow no server-side bidder at all.
+      it('authorises every PBS-side bidder when the publisher only named ocm', function () {
+        setFilterSettings({ iframe: { bidders: ['ocm'], filter: 'include' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).iframe).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      // Dropping ocm from an exclude list can empty it. An empty `bidders` array is not a valid PBS
+      // filter, so the type falls back to allow-all and PBS decides.
+      it('falls back to allow-all when an exclude list named only ocm', function () {
+        setFilterSettings({ image: { bidders: ['ocm'], filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      it('applies filterSettings.all to both sync types', function () {
+        setFilterSettings({ all: { bidders: ['bidderA'], filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: true, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url)).to.deep.equal({
+          iframe: { bidders: ['bidderA'], filter: 'exclude' },
+          image: { bidders: ['bidderA'], filter: 'exclude' }
+        });
+      });
+
+      // Core rejects a type configured through both "all" and its own key (they are mutually
+      // exclusive) and ignores filterSettings for it; forwarding either half would apply a rule core
+      // itself refused to honour.
+      it('ignores filterSettings for a type configured through both "all" and its own key', function () {
+        setFilterSettings({
+          all: { bidders: ['bidderA'], filter: 'exclude' },
+          image: { bidders: ['bidderB'], filter: 'exclude' }
+        });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      it('allows all bidders for an enabled type the publisher did not configure', function () {
+        setFilterSettings({ image: { bidders: '*', filter: 'include' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: true, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).iframe).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      // Core rejects an entry with no `bidders` list as malformed and ignores it, so it names nobody
+      // here either — every PBS-side bidder stays authorised rather than the type being narrowed.
+      it('allows all bidders when the publisher entry has no bidders list', function () {
+        setFilterSettings({ iframe: { filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).iframe).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      // Core outlaws '*' as a member of a bidders array (and any non-string): it warns and ignores the
+      // entry, leaving syncing permitted. Forwarding the list anyway would enforce against PBS an
+      // exclusion core itself discarded.
+      it('ignores an exclude list core rejects as malformed', function () {
+        setFilterSettings({ image: { bidders: ['bidderA', '*'], filter: 'exclude' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      it('ignores an entry whose filter value core rejects', function () {
+        setFilterSettings({ image: { bidders: ['bidderA'], filter: 'blocklist' } });
+        const syncs = spec.getUserSyncs({ iframeEnabled: false, pixelEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).image).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
+
+      it('ignores a filterSettings value that is not an object', function () {
+        setFilterSettings([]);
+        const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses);
+        expect(forwardedFilterSettings(syncs[0].url).iframe).to.deep.equal({
+          bidders: '*',
+          filter: 'include'
+        });
+      });
     });
 
-    it('includes the account echoed by PBS in the auction response', function () {
-      const responses = [{ body: { ext: { account: 'echoed-789', responsetimemillis: { appnexus: 80 } } } }];
-      const syncs = spec.getUserSyncs({ iframeEnabled: true }, responses);
-      expect(syncs[0].url).to.contain('account=echoed-789');
+    describe('privacy gates', function () {
+      it('registers no syncs when COPPA is enabled', function () {
+        const warn = sinon.stub(utils, 'logWarn');
+        try {
+          expect(spec.getUserSyncs({ iframeEnabled: true }, syncResponses, undefined, undefined, undefined, true)).to.deep.equal([]);
+          expect(warn.called).to.equal(true);
+        } finally {
+          warn.restore();
+        }
+      });
+
+      it('registers no syncs when GDPR applies without purpose 1 consent', function () {
+        const warn = sinon.stub(utils, 'logWarn');
+        try {
+          const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses, {
+            gdprApplies: true,
+            consentString: 'consent-xyz',
+            vendorData: { purpose: { consents: { 1: false } } }
+          });
+          expect(syncs).to.deep.equal([]);
+          expect(warn.called).to.equal(true);
+        } finally {
+          warn.restore();
+        }
+      });
+
+      it('registers syncs when purpose 1 consent is given', function () {
+        const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses, purpose1Consent);
+        expect(syncs).to.have.lengthOf(1);
+      });
+
+      it('registers syncs when GDPR does not apply', function () {
+        const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses, { gdprApplies: false });
+        expect(syncs).to.have.lengthOf(1);
+      });
     });
 
-    it('scopes the sync account to the auction response and never a captured fallback', function () {
-      // Regression: the cookie_sync account must come only from THIS auction's response (ext.account),
-      // not from a module-level value captured during buildRequests — otherwise an overlapping auction
-      // could leak its publisher account into this sync. buildRequests runs first (it used to capture
-      // account=pub-123) but the response below echoes no account, so no account must be emitted.
+    // Builds an auction response that answers a request the adapter actually produced. ORTB requires
+    // BidResponse.id to be the id of the request it answers (PBS sets it from exactly that), and the
+    // adapter relies on it to match a sync back to the publisher account of its auction.
+    function responseTo(serverRequest) {
+      return [{ body: { id: serverRequest.data.id, ext: { responsetimemillis: { appnexus: 80 } } } }];
+    }
+
+    it('includes the publisher account the auction ran under', function () {
+      const request = spec.buildRequests([bannerBid], bannerBidderRequest);
+      const syncs = spec.getUserSyncs({ iframeEnabled: true }, responseTo(request));
+      expect(syncs[0].url).to.contain('account=pub-123');
+    });
+
+    // In-app traffic carries the publisher on `app` rather than `site` (see buildRequests above), and
+    // that is the object PBS resolves the account from, so the sync has to follow it there.
+    it('takes the account from the app publisher for in-app traffic', function () {
+      const request = spec.buildRequests([bannerBid], {
+        ...bannerBidderRequest,
+        ortb2: { app: { bundle: 'com.orangeclickmedia.demo' } }
+      });
+      const syncs = spec.getUserSyncs({ iframeEnabled: true }, responseTo(request));
+      expect(syncs[0].url).to.contain('account=pub-123');
+    });
+
+    // Regression: the account must be scoped to the auction that produced the response. The original
+    // implementation kept a single module-level value captured in buildRequests, which any overlapping
+    // OCM auction (or a second pbjs instance) overwrote — leaking one publisher's account into
+    // another publisher's sync.
+    it('keeps each auction account separate when two auctions overlap', function () {
+      const otherBid = { ...bannerBid, params: { ...baseParams, publisherId: 'pub-999' } };
+
+      const first = spec.buildRequests([bannerBid], bannerBidderRequest);
+      const second = spec.buildRequests([otherBid], { ...bannerBidderRequest, bids: [otherBid] });
+
+      // Second auction built last: a captured scalar would answer pub-999 for both.
+      const syncForFirst = spec.getUserSyncs({ iframeEnabled: true }, responseTo(first));
+      const syncForSecond = spec.getUserSyncs({ iframeEnabled: true }, responseTo(second));
+
+      expect(syncForFirst[0].url).to.contain('account=pub-123');
+      expect(syncForSecond[0].url).to.contain('account=pub-999');
+    });
+
+    // No account at all is better than the wrong one: PBS applies the named account's cookie-sync
+    // policy, so falling back to some other auction's publisher would sync under the wrong rules.
+    it('omits the account when no request matches the response', function () {
       spec.buildRequests([bannerBid], bannerBidderRequest);
+      // syncResponses carries no id, so it answers none of the requests built above.
       const syncs = spec.getUserSyncs({ iframeEnabled: true }, syncResponses);
+      expect(syncs[0].url).to.not.contain('account=');
+    });
+
+    // Nothing to name when the auction itself carried no publisher, so the sync omits the account
+    // rather than emitting an empty one. (isBidRequestValid rejects such a bid before buildRequests in
+    // the real pipeline; addOrtbPublisherData guards the same case on the request side.)
+    it('omits the account when the auction carried no publisher', function () {
+      const noPublisherBid = { ...bannerBid, params: { placementId: 'plc-456' } };
+      const request = spec.buildRequests([noPublisherBid], { ...bannerBidderRequest, bids: [noPublisherBid] });
+      const syncs = spec.getUserSyncs({ iframeEnabled: true }, responseTo(request));
+      expect(syncs[0].url).to.not.contain('account=');
+    });
+
+    // The tracked accounts are capped so a long-lived page cannot grow them without bound; the oldest
+    // auction is evicted first and its sync then simply carries no account.
+    it('stops naming the account of an auction evicted by newer ones', function () {
+      const oldest = spec.buildRequests([bannerBid], bannerBidderRequest);
+      for (let i = 0; i < 20; i++) {
+        spec.buildRequests([bannerBid], bannerBidderRequest);
+      }
+      const syncs = spec.getUserSyncs({ iframeEnabled: true }, responseTo(oldest));
       expect(syncs[0].url).to.not.contain('account=');
     });
 
@@ -837,7 +1545,7 @@ describe('ocmBidAdapter', function () {
       const syncs = spec.getUserSyncs(
         { iframeEnabled: true },
         syncResponses,
-        { gdprApplies: true, consentString: 'consent-xyz' },
+        purpose1Consent,
         '1YNN',
         { gppString: 'DBACNYA', applicableSections: [7, 8] }
       );
@@ -847,6 +1555,20 @@ describe('ocmBidAdapter', function () {
       expect(url).to.contain('us_privacy=1YNN');
       expect(url).to.contain('gpp=DBACNYA');
       expect(decodeURIComponent(url)).to.contain('gpp_sid=7,8');
+    });
+
+    // Consent signals must ride along on the image path too, not just the iframe loader.
+    it('forwards consent on the image fallback as well', function () {
+      const syncs = spec.getUserSyncs(
+        { iframeEnabled: false, pixelEnabled: true },
+        syncResponses,
+        purpose1Consent,
+        '1YNN'
+      );
+      expect(syncs[0].type).to.equal('image');
+      expect(syncs[0].url).to.contain('gdpr=1');
+      expect(syncs[0].url).to.contain('gdpr_consent=consent-xyz');
+      expect(syncs[0].url).to.contain('us_privacy=1YNN');
     });
   });
 
