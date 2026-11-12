@@ -1075,6 +1075,31 @@ describe('adapterManager tests', function () {
       'start': 1462918897460
     }];
 
+    it('does not send one Prebid Server the bidder requests (and bidder data) meant for another', () => {
+      const requests = utils.deepClone(bidRequests);
+      const [appnexusRequest, pubmaticRequest] = requests;
+      appnexusRequest.ortb2 = { site: { keywords: 'appnexus-only' } };
+      pubmaticRequest.ortb2 = { site: { keywords: 'pubmatic-only' } };
+
+      adapterManager.callBids(getAdUnits(), requests, () => {}, () => {});
+      sinon.assert.calledTwice(prebidServerAdapterMock.callBids);
+
+      const sentToServer = {};
+      prebidServerAdapterMock.callBids.getCalls().forEach(call => {
+        const [{ s2sConfig }, bidderRequests] = call.args;
+        const server = s2sConfig.accountId;
+        sentToServer[server] = bidderRequests.map(request => request.bidderCode);
+        bidderRequests.forEach(request => {
+          expect(s2sConfig.bidders, `server '${server}' received the '${request.bidderCode}' bidder request`).to.include(request.bidderCode);
+        });
+        expect(
+          bidderRequests[0].ortb2.site.keywords,
+          `server '${server}' would build its request from another server's bidder data`
+        ).to.equal(`${s2sConfig.bidders[0]}-only`);
+      });
+      expect(sentToServer).to.eql({ abc: ['appnexus'], def: ['pubmatic'] });
+    });
+
     describe('invokes callBids on the S2S adapter', () => {
       let onTimelyResponse, timedOut, done;
       beforeEach(() => {
@@ -2216,6 +2241,36 @@ describe('adapterManager tests', function () {
       });
       requests.rubicon.bids.forEach((bid) => expect(bid.ortb2).to.eql(requests.rubicon.ortb2));
       requests.appnexus.bids.forEach((bid) => expect(bid.ortb2).to.eql(requests.appnexus.ortb2));
+    });
+
+    describe('bidder-specific schain', () => {
+      const schain = (asi) => ({ ver: '1.0', complete: 1, nodes: [{ asi, sid: '1', hp: 1 }] });
+      function requestsWithSchains() {
+        return Object.fromEntries(
+          adapterManager.makeBidRequests(adUnits, 123, 'auction-id', 123, [], {
+            global: { source: { ext: { schain: schain('global') } } },
+            bidder: { appnexus: { source: { ext: { schain: schain('appnexus') } } } }
+          }).map((r) => [r.bidderCode, r])
+        );
+      }
+
+      afterEach(() => {
+        config.resetConfig();
+      });
+
+      it('should append the bidder schain nodes to the global ones by default', () => {
+        const requests = requestsWithSchains();
+        expect(requests.appnexus.ortb2.source.ext.schain.nodes.map(n => n.asi)).to.eql(['global', 'appnexus']);
+        expect(requests.rubicon.ortb2.source.ext.schain).to.eql(schain('global'));
+      });
+
+      it('should give bidders their own schain with firstPartyData.replaceGlobalSchain', () => {
+        config.setConfig({ firstPartyData: { replaceGlobalSchain: true } });
+        const requests = requestsWithSchains();
+        expect(requests.appnexus.ortb2.source.ext.schain).to.eql(schain('appnexus'));
+        expect(requests.rubicon.ortb2.source.ext.schain).to.eql(schain('global'));
+        requests.appnexus.bids.forEach((bid) => expect(bid.ortb2.source.ext.schain).to.eql(schain('appnexus')));
+      });
     });
 
     describe('transaction IDs', () => {

@@ -895,6 +895,56 @@ describe('auctionmanager.js', function () {
         }
       });
     });
+
+    describe('house bids', () => {
+      const index = (bidderRequest) => ({ getBidRequest: () => undefined, getBidderRequest: () => bidderRequest });
+      function mkHouseBid(deal = {}) {
+        return Object.assign({}, createBid(), fixtures.getBidResponses()[5], { cpm: 0, meta: { deal: { priority: 14, ...deal } } });
+      }
+      function allowHouseBids(bid) {
+        getGlobal().bidderSettings = { [bid.bidderCode]: { allowHouseBids: true } };
+      }
+
+      afterEach(() => {
+        getGlobal().bidderSettings = {};
+      });
+
+      it('are flagged when the adapter is allowed house and priority bids and the trusted priority is above the default', () => {
+        const bid = mkHouseBid();
+        allowHouseBids(bid);
+        adjustBids(bid, { index: index({ bidderCode: bid.bidderCode, allowPriorityBids: true }) });
+        expect(bid.houseBid).to.be.true;
+        expect(bid.priority).to.equal(14);
+      });
+
+      it('are not flagged when the adapter is not allowed house bids', () => {
+        const bid = mkHouseBid();
+        adjustBids(bid, { index: index({ bidderCode: bid.bidderCode, allowPriorityBids: true }) });
+        expect(bid.houseBid).to.be.false;
+      });
+
+      it('are not flagged when the bidder request does not allow priority bids', () => {
+        const bid = mkHouseBid();
+        allowHouseBids(bid);
+        adjustBids(bid, { index: index({ bidderCode: bid.bidderCode }) });
+        expect(bid.houseBid).to.be.false;
+      });
+
+      it('are not flagged for declaring the house deal type without a low priority', () => {
+        const bid = mkHouseBid({ type: 4, priority: undefined });
+        allowHouseBids(bid);
+        adjustBids(bid, { index: index({ bidderCode: bid.bidderCode, allowPriorityBids: true }) });
+        expect(bid.houseBid).to.be.false;
+        expect(bid.priority).to.equal(DEFAULT_PRIORITY);
+      });
+
+      it('overwrite a houseBid flag set by the adapter', () => {
+        const bid = Object.assign(mkHouseBid({ priority: DEFAULT_PRIORITY }), { houseBid: true });
+        allowHouseBids(bid);
+        adjustBids(bid, { index: index({ bidderCode: bid.bidderCode, allowPriorityBids: true }) });
+        expect(bid.houseBid).to.be.false;
+      });
+    });
   });
 
   describe('createAuction', () => {
@@ -1498,6 +1548,71 @@ describe('auctionmanager.js', function () {
           }).to.not.throw();
           expect(prepared.renderer).to.not.exist;
         });
+
+        describe('bid-level configuration', () => {
+          function makeBidRequest(adUnitProps, bidProps) {
+            const adUnit = {
+              code: 'precedence',
+              mediaTypes: { banner: { sizes: [[300, 250]] } },
+              bids: [{ bidder: BIDDER_CODE, params: {}, ...bidProps }],
+              ...adUnitProps,
+            };
+            const [bidderRequest] = adapterManager.makeBidRequests.wrappedMethod([adUnit], 'precedence-auction', Date.now(), 1000);
+            return { bidderRequest, adUnit };
+          }
+
+          function prepareResponse({ adUnit, bidderRequest }) {
+            const index = {
+              getAdUnit: () => adUnit,
+              getBidRequest: () => bidderRequest.bids[0],
+              getMediaTypes: () => bidderRequest.bids[0].mediaTypes,
+            };
+            return auctionModule.getPreparedBidForAuction({ cpm: 1, bidderCode: BIDDER_CODE, mediaType: 'banner' }, { index });
+          }
+
+          ['renderer', 'safeRenderer'].forEach(prop => {
+            describe(`for ${prop}`, () => {
+              Object.entries({
+                'defined only on adUnit': {
+                  adUnitProps: {
+                    [prop]: {
+                      url: 'target.js',
+                      render() {}
+                    }
+                  }
+                },
+                'defined on adUnit bid': {
+                  adUnitProps: {
+                    [prop]: {
+                      url: 'noise.js',
+                      render() {}
+                    }
+                  },
+                  bidProps: {
+                    [prop]: {
+                      url: 'target.js',
+                      render() {}
+                    }
+                  }
+                }
+              }).forEach(([desc, { adUnitProps, bidProps }]) => {
+                describe(desc, () => {
+                  let adUnit, bidderRequest, bidResponse;
+                  beforeEach(() => {
+                    ({ adUnit, bidderRequest } = makeBidRequest(adUnitProps, bidProps));
+                    bidResponse = prepareResponse({ adUnit, bidderRequest });
+                  });
+                  it('should be set on the request', () => {
+                    expect(bidderRequest.bids[0][prop].url).to.eql('target.js');
+                  });
+                  it('should be set on the response', () => {
+                    expect(bidResponse[prop].url).to.eql('target.js');
+                  });
+                });
+              });
+            });
+          });
+        });
       });
 
       it('installs publisher-defined backup renderers on bids', function () {
@@ -1764,6 +1879,9 @@ describe('auctionmanager.js', function () {
           assert.equal(auctionProps.adUnits, adUnits);
           assert.equal(auctionProps.timeout, 20);
           assert.equal(auctionProps.auctionStatus, AUCTION_COMPLETED);
+          assert.equal(auctionProps.timedOutRequests.length, 1);
+          assert.equal(auctionProps.timedOutRequests[0].bidder, BIDDER_CODE1);
+          assert.equal(auctionProps.timedOutRequests[0].bidId, timedOutBids[0].bidId);
         });
         respondToRequest(0);
         return pm;
@@ -1825,28 +1943,21 @@ describe('auctionmanager.js', function () {
           }]
         });
         adUnits[0].bids.push({ bidder: 'mock-s2s-1' }, { bidder: 'mock-s2s-2' });
-        const s2sAdUnits = deepClone(adUnits);
-        bids.unshift(
-          mockBid({ bidderCode: 'mock-s2s-1', src: S2S.SRC, adUnits: s2sAdUnits, uniquePbsTid: '1' }),
-          mockBid({ bidderCode: 'mock-s2s-2', src: S2S.SRC, adUnits: s2sAdUnits, uniquePbsTid: '2' })
-        );
-        Object.assign(s2sAdUnits[0], {
+        const s2sBids = ['1', '2'].map(pbsTid => mockBid({
+          bidderCode: `mock-s2s-${pbsTid}`,
+          src: S2S.SRC,
+          adUnits: deepClone(adUnits),
+          uniquePbsTid: pbsTid
+        }));
+        s2sBids.forEach(bid => Object.assign(bid._ctx.adUnits[0], {
           mediaTypes: {
             banner: {
               sizes: [[300, 250], [300, 600]]
             }
           },
-          bids: [
-            {
-              bidder: 'mock-s2s-1',
-              bid_id: bids[0].requestId
-            },
-            {
-              bidder: 'mock-s2s-2',
-              bid_id: bids[1].requestId
-            }
-          ]
-        });
+          bids: [{ bidder: bid.bidderCode, bid_id: bid.requestId }]
+        }));
+        bids.unshift(...s2sBids);
 
         const pm = runAuction().then(() => {
           const toBids = eventsEmitSpy.withArgs(EVENTS.BID_TIMEOUT).getCalls()[0].args[1];
